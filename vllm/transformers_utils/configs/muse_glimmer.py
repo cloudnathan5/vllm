@@ -358,8 +358,15 @@ class MuseGlimmerAssistantConfig(Qwen3Config):
 
     model_type = "muse_glimmer_assistant"
 
-    def __init__(self, use_sliding_window: bool = True, **kwargs):
-        super().__init__(use_sliding_window=use_sliding_window, **kwargs)
+    def __init__(
+        self,
+        use_sliding_window: bool = True,
+        vocab_size: int = 202_048,
+        **kwargs,
+    ):
+        super().__init__(
+            use_sliding_window=use_sliding_window, vocab_size=vocab_size, **kwargs
+        )
 
 
 __all__ = [
