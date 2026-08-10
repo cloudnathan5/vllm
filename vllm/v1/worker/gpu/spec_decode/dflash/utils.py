@@ -54,7 +54,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    target_inner = target_language_model.model
+    # Most targets return a ``*ForCausalLM`` here, whose ``.model`` holds the
+    # embedding. A target that registers its inner model directly (Muse Glimmer
+    # marks ``MuseGlimmerModel`` as its language model) already *is* that level,
+    # and has no further ``.model`` to walk into.
+    target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
     # Skip embedding sharing under PP — each rank owns its own embedding.

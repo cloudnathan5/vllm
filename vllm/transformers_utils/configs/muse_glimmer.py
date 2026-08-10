@@ -14,6 +14,7 @@ and vision configs are consumed by the native multimodal serving path.
 
 from __future__ import annotations
 
+from transformers import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -343,4 +344,27 @@ class MuseGlimmerConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["MuseGlimmerTextConfig", "MuseGlimmerVisionConfig", "MuseGlimmerConfig"]
+class MuseGlimmerAssistantConfig(Qwen3Config):
+    """Config for the DFlash draft head.
+
+    The drafter is Qwen3-shaped, but ``Qwen3Config`` only keeps
+    ``sliding_window`` when ``use_sliding_window`` is set, and the published
+    checkpoint carries ``sliding_window: 2048`` without that flag. Loading it
+    straight into ``Qwen3Config`` silently drops the window to ``None``, and
+    every draft layer is ``sliding_attention``, so layer resolution then fails
+    with "DFlash sliding attention requires a window size". Default the flag on
+    and let the checkpoint override it.
+    """
+
+    model_type = "muse_glimmer_assistant"
+
+    def __init__(self, use_sliding_window: bool = True, **kwargs):
+        super().__init__(use_sliding_window=use_sliding_window, **kwargs)
+
+
+__all__ = [
+    "MuseGlimmerTextConfig",
+    "MuseGlimmerVisionConfig",
+    "MuseGlimmerConfig",
+    "MuseGlimmerAssistantConfig",
+]

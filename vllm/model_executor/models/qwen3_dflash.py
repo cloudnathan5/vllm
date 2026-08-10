@@ -54,6 +54,16 @@ logger = init_logger(__name__)
 
 _SLIDING_ATTENTION = "sliding_attention"
 
+# Muse Glimmer's DFlash head groups the aux-hidden-state projection and its
+# output norm under an "encoder." prefix, where the Qwen3 DFlash reference ships
+# them top-level as fc/hidden_norm. Same tensors, same shapes -- fc is
+# (hidden, num_aux_layers * hidden) and the norm is (hidden,) -- so only the
+# names differ.
+_DFLASH_ENCODER_RENAMES = {
+    "encoder.fc.": "fc.",
+    "encoder.output_norm_enc.": "hidden_norm.",
+}
+
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
@@ -809,6 +819,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "overridden by a mask_embedding.pt file); it should not ship a "
                 "mask_hidden weight."
             )
+            for src, dst in _DFLASH_ENCODER_RENAMES.items():
+                if name.startswith(src):
+                    name = dst + name[len(src) :]
+                    break
             if "t2d" in name:
                 continue
             if "d2t" in name:

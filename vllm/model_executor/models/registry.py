@@ -625,6 +625,11 @@ _SPECULATIVE_DECODING_MODELS = {
     # safetensors as DFlashDraftModel — only the name in the checkpoint's
     # config.json changed, with the Onyx -> Muse Glimmer rename.
     "MuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    # EAGLEConfig rewrites a dflash drafter's architecture to "DFlash{arch}"
+    # unless it already starts or ends with "DFlash", so the name that actually
+    # reaches this registry for a Muse Glimmer drafter is the prefixed one.
+    # Registering only the bare name above leaves it unresolvable.
+    "DFlashMuseGlimmerAssistantModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (

@@ -1601,6 +1601,19 @@ class MuseGlimmerForCausalLM(
                 embeddings.extend(self._process_video_input(video_input))
         return embeddings
 
+    # The SupportsEagle3 defaults resolve the aux-hidden-state carrier as
+    # ``get_language_model().model``, which assumes the language model is a
+    # ``*ForCausalLM`` wrapper. ``_mark_language_model`` makes
+    # ``get_language_model()`` return ``MuseGlimmerModel`` itself -- already the
+    # EagleModelMixin -- so there is no further ``.model`` to walk into and the
+    # defaults assert. Address it directly instead.
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
     def forward(
         self,
         input_ids: torch.Tensor | None,

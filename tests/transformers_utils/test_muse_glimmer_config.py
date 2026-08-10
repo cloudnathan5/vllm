@@ -81,3 +81,48 @@ if __name__ == "__main__":
     test_flat_config_no_silent_default()
     test_nested_config_unchanged()
     print("ALL MUSE_GLIMMER CONFIG TESTS PASSED")
+
+
+def test_assistant_config_keeps_sliding_window():
+    """The DFlash drafter's window must survive Qwen3Config's use_sliding_window gate.
+
+    The published drafter carries ``sliding_window: 2048`` but no
+    ``use_sliding_window`` flag, and Qwen3Config drops the window to None
+    unless that flag is set. Every draft layer is ``sliding_attention``, so
+    losing it fails layer resolution with "DFlash sliding attention requires a
+    window size" rather than degrading quietly.
+    """
+    from vllm.transformers_utils.configs.muse_glimmer import (
+        MuseGlimmerAssistantConfig,
+    )
+
+    cfg = MuseGlimmerAssistantConfig(
+        sliding_window=2048,
+        layer_types=["sliding_attention"] * 5,
+        num_hidden_layers=5,
+    )
+    assert cfg.sliding_window == 2048
+    assert cfg.use_sliding_window is True
+
+
+def test_assistant_model_type_resolves_to_assistant_config():
+    """``muse_glimmer_assistant`` must map to the config that keeps the window."""
+    from vllm.transformers_utils.config import _CONFIG_REGISTRY
+
+    assert (
+        _CONFIG_REGISTRY["muse_glimmer_assistant"].__name__
+        == "MuseGlimmerAssistantConfig"
+    )
+
+
+def test_dflash_prefixed_drafter_architecture_is_registered():
+    """EAGLEConfig rewrites the drafter arch to ``DFlash{arch}`` before lookup.
+
+    Registering only the bare name leaves the architecture that actually
+    reaches the registry unresolvable.
+    """
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    archs = ModelRegistry.get_supported_archs()
+    assert "MuseGlimmerAssistantModel" in archs
+    assert "DFlashMuseGlimmerAssistantModel" in archs
