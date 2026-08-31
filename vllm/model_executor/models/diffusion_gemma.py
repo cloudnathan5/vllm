@@ -1008,7 +1008,7 @@ class DiffusionGemmaModelState(ModelState):
             num_reqs = input_batch.num_reqs
             num_tokens = input_batch.num_tokens
 
-        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np).pin_memory()
         max_query_len = input_batch.num_scheduled_tokens.max().item()
 
         # Per-request causal mode: encoder (commit) = causal,
