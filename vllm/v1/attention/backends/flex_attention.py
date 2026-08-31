@@ -358,7 +358,11 @@ def copy_to_persistent(dst, src):
 
 @dataclass
 class FlexAttentionMetadata:
-    causal: bool
+    # Scalar for homogeneous batches; a per-request bool tensor for models
+    # that mix causal and bidirectional requests in one batch (e.g. diffusion
+    # decoders: encoder-phase requests are causal, denoise-phase requests are
+    # bidirectional).
+    causal: bool | torch.Tensor
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
     query_start_loc: torch.Tensor
@@ -466,6 +470,32 @@ class FlexAttentionMetadata:
         layout of the query and key/value tensors.
         """
         assert self.doc_ids is not None
+
+        if isinstance(self.causal, torch.Tensor):
+            # Per-request causal: dispatch between causal and bidirectional
+            # per query token based on its request's phase.
+            causal_per_req = self.causal
+            doc_ids = self.doc_ids
+
+            def per_req_mask_mod(
+                b: torch.Tensor,
+                h: torch.Tensor,
+                q_idx: torch.Tensor,
+                physical_kv_idx: torch.Tensor,
+            ) -> torch.Tensor:
+                (is_valid, logical_q_idx, logical_kv_idx) = (
+                    self._convert_physical_to_logical(
+                        doc_ids, q_idx, physical_kv_idx
+                    )
+                )
+                keep = torch.where(
+                    causal_per_req[doc_ids[q_idx]],
+                    logical_q_idx >= logical_kv_idx,
+                    logical_kv_idx >= 0,
+                )
+                return is_valid & keep
+
+            return per_req_mask_mod
 
         def final_mask_mod(
             b: torch.Tensor,
@@ -725,8 +755,10 @@ class FlexAttentionMetadata:
 
         custom_hint = self.block_sparsity_hint is not None
         use_rswa = self.rswa_window is not None and self.rswa_prefix_lens is not None
+        causal_is_tensor = isinstance(self.causal, torch.Tensor)
+        causal_any = bool(self.causal.any()) if causal_is_tensor else self.causal
         needs_per_q_pruning = (
-            self.causal or self.sliding_window or custom_hint or use_rswa
+            causal_any or self.sliding_window or custom_hint or use_rswa
         )
 
         if needs_per_q_pruning:
@@ -743,8 +775,13 @@ class FlexAttentionMetadata:
             block_starts = self.logical_block_ids * self.block_size
             block_ends = block_starts + self.block_size
 
-            if self.causal:
+            if causal_any:
                 future_blocks = block_starts[None, :] > logical_q_idx[:, None]
+                if causal_is_tensor:
+                    # Only prune future blocks for requests in causal phase.
+                    future_blocks = (
+                        future_blocks & self.causal[self.doc_ids][:, None]
+                    )
                 used_pages.masked_fill_(future_blocks, 0)
 
             if self.sliding_window:
@@ -1094,11 +1131,17 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             )
 
         uses_paged_kv = not isinstance(self.kv_cache_spec, EncoderOnlyAttentionSpec)
-        logical_mask_mod = (
-            bidirectional_mask_mod
-            if uses_paged_kv and not common_attn_metadata.causal
-            else causal_mask_mod
-        )
+        causal = common_attn_metadata.causal
+        if isinstance(causal, torch.Tensor):
+            # Per-request causal is handled inside get_paged_mask_mod;
+            # logical_mask_mod is unused in that path.
+            logical_mask_mod = causal_mask_mod
+        else:
+            logical_mask_mod = (
+                bidirectional_mask_mod
+                if uses_paged_kv and not causal
+                else causal_mask_mod
+            )
 
         sliding_window = None
         if self._uses_full_cudagraphs():
