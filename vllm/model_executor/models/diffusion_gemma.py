@@ -784,7 +784,19 @@ class DiffusionGemmaModelState(ModelState):
         self._pending_mm_embeds: tuple[list[torch.Tensor], torch.Tensor] | None = None
 
         diffusion_config = vllm_config.diffusion_config
-        canvas_length = diffusion_config.canvas_length if diffusion_config else 32
+        # Prefer an explicit --diffusion-config canvas_length; otherwise fall
+        # back to the model's own config (DiffusionGemma checkpoints declare
+        # canvas_length in config.json). The final 32 is a last-resort default
+        # for configs that carry neither.
+        canvas_length = (
+            diffusion_config.canvas_length if diffusion_config is not None else None
+        )
+        if canvas_length is None:
+            canvas_length = getattr(
+                self.model_config.hf_config, "canvas_length", None
+            )
+        if canvas_length is None:
+            canvas_length = 32
 
         text_config = self.model_config.hf_text_config
         self.gen_config = self.model_config.try_get_generation_config()
@@ -1078,9 +1090,9 @@ class DiffusionSampler:
         self.sc_vocab_end = sc_vocab_end if sc_vocab_end is not None else vocab_size
         self.tp_size = tp_size
         self.tp_group_name = tp_group_name
-        self.canvas_length = (
-            diffusion_config.canvas_length if diffusion_config is not None else 32
-        )
+        # diffusion_states.canvas_length is already resolved from the
+        # diffusion config / model config by DiffusionGemmaModelState.
+        self.canvas_length = diffusion_states.canvas_length
         self.t_min = t_min
         self.t_max = t_max
         self.confidence_threshold = confidence_threshold
