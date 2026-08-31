@@ -1289,6 +1289,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
+        if isinstance(causal, torch.Tensor):
+            raise NotImplementedError(
+                "FlashInfer does not support per-request causal tensors "
+                "(mixed causal/bidirectional batches from diffusion "
+                "decoders). Use an attention backend that does, e.g. "
+                "--attention-backend FLEX_ATTENTION."
+            )
         route_decode = causal or self.use_dedicated_xqa
         if route_decode:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
