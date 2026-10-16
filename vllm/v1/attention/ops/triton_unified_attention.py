@@ -35,6 +35,27 @@ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 # Longest per-request query (e.g. 1 + num_speculative_tokens) run by split-K.
 MAX_3D_QUERY_LEN = 8
+# Longest per-request query run by the wide-head canvas split-K path.
+MAX_CANVAS_QUERY_LEN = 512
+# Fewest keys per segment on that path; shorter batches stay 2D.
+CANVAS_MIN_SEGMENT_KEYS = 2048
+
+
+def use_wide_head_canvas(head_size: int, max_seqlen_q: int, sliding: bool) -> bool:
+    """Canvas-sized queries on 512-wide full-attention heads on SM12x.
+
+    For a DiffusionGemma canvas (8 query heads per KV head) the 2D launch
+    gives each 16-row block 2 tokens, so every block re-reads the whole KV
+    cache and one sequence under-fills the GPU. Split-K with 32-row blocks
+    addresses both.
+    """
+    return (
+        head_size == 512
+        and MAX_3D_QUERY_LEN < max_seqlen_q <= MAX_CANVAS_QUERY_LEN
+        and not sliding
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    )
 
 
 @triton.jit
@@ -276,6 +297,8 @@ def kernel_unified_attention(
     KV_QUANT_MODE: tl.constexpr = 0,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    # 3D: fewest KV tiles per segment; reduce_segments must get the same.
+    MIN_SEGMENT_TILES: tl.constexpr = 1,
     # Chunked / block-local attention.  ``CHUNK_LOOKBACK >= 0`` enables
     # chunked masking (used by Gemma3 block-local layers); takes precedence
     # over ``SLIDING_WINDOW`` inside the helpers.  ``-1`` disables.
@@ -323,6 +346,8 @@ def kernel_unified_attention(
 
     if IS_3D:
         tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+        if MIN_SEGMENT_TILES > 1:
+            tiles_per_segment = tl.maximum(tiles_per_segment, MIN_SEGMENT_TILES)
         if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
             return
     else:
@@ -719,6 +744,7 @@ def reduce_segments(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    MIN_SEGMENT_TILES: tl.constexpr = 1,
 ):
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
@@ -739,6 +765,8 @@ def reduce_segments(
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+    if MIN_SEGMENT_TILES > 1:
+        tiles_per_segment = tl.maximum(tiles_per_segment, MIN_SEGMENT_TILES)
 
     # create masks for subsequent loads
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
@@ -980,6 +1008,31 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    wide_head_canvas = (
+        use_wide_head_canvas(head_size, max_seqlen_q, window_size[0] >= 0)
+        and max_seqlen_k >= CANVAS_MIN_SEGMENT_KEYS
+        and num_queries_per_kv <= 16
+        and num_par_softmax_segments is not None
+        and softmax_segm_output is not None
+        and softmax_segm_max is not None
+        and softmax_segm_expsum is not None
+        and softmax_segm_max.shape[0] >= q.shape[0]
+        and softmax_segm_output.shape[-1] >= triton.next_power_of_2(head_size)
+        and mm_prefix_range is None
+        and not is_batch_invariant
+        # 16-bit queries over an fp8 cache exceed SM12x shared memory here.
+        and q.element_size() == k.element_size()
+    )
+    canvas_fp8 = k.element_size() == 1
+    if wide_head_canvas:
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        if canvas_fp8:
+            launch_num_warps = 8
+            launch_num_stages = 2
+        else:
+            launch_num_warps = 4
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -1012,6 +1065,10 @@ def unified_attention(
     # path (used when max_seqlen_q > 1) reads TILE_SIZE_PREFILL.
     if tuned_large_head:
         TILE_SIZE_PREFILL = 128
+    min_segment_tiles = 1
+    if wide_head_canvas:
+        TILE_SIZE_DECODE = 64 if canvas_fp8 else 32
+        min_segment_tiles = CANVAS_MIN_SEGMENT_KEYS // TILE_SIZE_DECODE
 
     # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
     # ``tl.static_assert`` in the kernel).  The default prefill tile
@@ -1067,7 +1124,8 @@ def unified_attention(
     #    large-head path applies, or
     # 3. The number of Q blocks exceeds seq_threshold_3D, or
     # 4. Batch invariance is enabled
-    use_3d = not (
+    # The wide-head canvas path checked its own conditions above.
+    use_3d = wide_head_canvas or not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
@@ -1197,6 +1255,7 @@ def unified_attention(
         NUM_SEGMENTS_PER_SEQ=num_segments,
         USE_FP8=output_scale is not None,
         IS_3D=use_3d,
+        MIN_SEGMENT_TILES=min_segment_tiles,
         KV_QUANT_MODE=kv_quant_mode,
         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
         CHUNK_LOOKBACK=chunk_lookback,
@@ -1227,4 +1286,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            MIN_SEGMENT_TILES=min_segment_tiles,
         )

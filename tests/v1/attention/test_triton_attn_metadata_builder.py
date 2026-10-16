@@ -52,6 +52,7 @@ def test_split_k_segments_follow_sm_occupancy(
         parallel_config=None,
         scheduler_config=SimpleNamespace(max_num_seqs=16),
         speculative_config=None,
+        diffusion_config=None,
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.NONE, static_forward_context={}
         ),
@@ -84,6 +85,7 @@ def _draft_builder(builder_cls, rswa_window: int | None):
         parallel_config=None,
         scheduler_config=SimpleNamespace(max_num_seqs=16),
         speculative_config=None,
+        diffusion_config=None,
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.NONE, static_forward_context={}
         ),

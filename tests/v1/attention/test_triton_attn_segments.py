@@ -9,7 +9,10 @@ import torch
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config import CUDAGraphMode
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder
+from vllm.v1.attention.backends.triton_attn import (
+    NUM_PAR_SOFTMAX_SEGMENTS,
+    TritonAttentionMetadataBuilder,
+)
 from vllm.v1.attention.backends.triton_attn_diffkv import (
     TritonAttentionDiffKVMetadataBuilder,
 )
@@ -26,10 +29,19 @@ def _build(
     num_speculative_tokens=None,
     parallel_drafting=False,
     kv_quant_mode=KVQuantMode.NONE,
+    head_size=128,
+    sliding_window=None,
+    canvas_length=None,
+    seq_len=128,
 ):
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         current_platform, "is_device_capability", lambda cap: cap == capability
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda cap, device_id=0: cap // 10 == capability[0],
     )
     monkeypatch.setattr(current_platform, "num_compute_units", lambda: 188)
     config = SimpleNamespace(
@@ -49,6 +61,11 @@ def _build(
                 parallel_drafting=parallel_drafting,
             )
         ),
+        diffusion_config=(
+            None
+            if canvas_length is None
+            else SimpleNamespace(canvas_length=canvas_length)
+        ),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.NONE, static_forward_context={}
         ),
@@ -56,12 +73,13 @@ def _build(
     spec = FullAttentionSpec(
         block_size=16,
         num_kv_heads=num_kv_heads,
-        head_size=128,
+        head_size=head_size,
         dtype=torch.bfloat16,
         kv_quant_mode=kv_quant_mode,
+        sliding_window=sliding_window,
     )
     builder = builder_cls(spec, ["layer.0"], config, "cpu")
-    batch = BatchSpec(seq_lens=[128] * len(query_lens), query_lens=query_lens)
+    batch = BatchSpec(seq_lens=[seq_len] * len(query_lens), query_lens=query_lens)
     metadata = builder.build(0, create_common_attn_metadata(batch, 16, "cpu"))
     assert metadata.softmax_segm_output.shape[2] == metadata.num_par_softmax_segments
     assert metadata.softmax_segm_max.shape[0] >= sum(query_lens)
@@ -156,3 +174,44 @@ def test_split_k_scratch_rows_follow_speculative_config(
     assert builder.softmax_segm_output.shape == (rows, 8, 16, 128)
     assert builder.softmax_segm_max.shape == (rows, 8, 16)
     assert builder.softmax_segm_expsum.shape == (rows, 8, 16)
+
+
+# Diffusion canvases on 512-wide full-attention heads (SM12x): scratch for 4
+# canvases at the group's head size (the model reports 128), 16-segment view.
+@pytest.mark.parametrize(
+    "capability,head_size,sliding_window,max_num_seqs,canvases",
+    [
+        ((12, 0), 512, None, 16, 4),
+        ((12, 0), 512, 1024, 16, 0),
+        ((9, 0), 512, None, 16, 0),
+    ],
+)
+def test_split_k_scratch_holds_diffusion_canvases(
+    monkeypatch,
+    capability,
+    head_size,
+    sliding_window,
+    max_num_seqs,
+    canvases,
+):
+    builder, metadata = _build(
+        monkeypatch,
+        TritonAttentionMetadataBuilder,
+        capability,
+        2,
+        [256] * canvases if canvases else [1],
+        max_num_seqs,
+        head_size=head_size,
+        sliding_window=sliding_window,
+        canvas_length=256,
+        seq_len=4096,
+    )
+    rows_16 = builder.softmax_segm_max.numel() // (8 * NUM_PAR_SOFTMAX_SEGMENTS)
+    if canvases:
+        assert rows_16 >= canvases * 256
+        assert builder.softmax_segm_output.shape[-1] == 512
+        assert metadata.num_par_softmax_segments == NUM_PAR_SOFTMAX_SEGMENTS
+        assert metadata.softmax_segm_max.shape[0] >= canvases * 256
+    else:
+        assert rows_16 < 256
+        assert builder.softmax_segm_output.shape[-1] == 128

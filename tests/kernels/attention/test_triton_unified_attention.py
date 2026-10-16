@@ -9,7 +9,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import next_power_of_2
+from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.ops import triton_unified_attention as attention
 from vllm.v1.attention.ops.triton_attention_helpers import (
@@ -18,6 +18,7 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     softmax_step,
 )
 from vllm.v1.attention.ops.triton_unified_attention import (
+    CANVAS_MIN_SEGMENT_KEYS,
     MAX_3D_QUERY_LEN,
     reduce_segments,
     unified_attention,
@@ -383,6 +384,175 @@ def test_clamped_mm_prefix_preserves_noncausal_right_window(
     assert bounds.tolist() == [3, 68, 4096]
 
 
+def _canvas_launch(
+    monkeypatch,
+    *,
+    query_len=256,
+    max_seqlen_k=4096,
+    window=(-1, -1),
+    scratch_rows=512,
+    sm12x=True,
+    q_dtype=torch.bfloat16,
+    kv_dtype=torch.bfloat16,
+):
+    """Launch kwargs for two canvases, one causal and one bidirectional."""
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: sm12x)
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda capability, device_id=0: sm12x and capability // 10 == 12,
+    )
+    query = torch.empty((2 * query_len, 16, 512), dtype=q_dtype, device="cpu")
+    cache = torch.empty((1, 32, 2, 512), dtype=kv_dtype, device="cpu")
+    kernel = MagicMock()
+    monkeypatch.setattr(attention, "kernel_unified_attention", kernel)
+    monkeypatch.setattr(attention, "reduce_segments", MagicMock())
+    unified_attention(
+        query,
+        cache,
+        cache,
+        torch.empty_like(query),
+        torch.tensor([0, query_len, 2 * query_len], dtype=torch.int32, device="cpu"),
+        query_len,
+        torch.full((2,), max_seqlen_k, dtype=torch.int32, device="cpu"),
+        max_seqlen_k,
+        512**-0.5,
+        torch.tensor([True, False], device="cpu"),
+        window,
+        torch.zeros((2, 128), dtype=torch.int32, device="cpu"),
+        0.0,
+        None,
+        None,
+        None,
+        seq_threshold_3D=8,
+        num_par_softmax_segments=16,
+        softmax_segm_output=torch.empty((scratch_rows, 16, 16, 512), device="cpu"),
+        softmax_segm_max=torch.empty((scratch_rows, 16, 16), device="cpu"),
+        softmax_segm_expsum=torch.empty((scratch_rows, 16, 16), device="cpu"),
+        kv_quant_mode=(
+            KVQuantMode.FP8_PER_TENSOR if kv_dtype == FP8_DTYPE else KVQuantMode.NONE
+        ),
+    )
+    return kernel.__getitem__.return_value.call_args.kwargs
+
+
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ({}, True),
+        ({"q_dtype": FP8_DTYPE, "kv_dtype": FP8_DTYPE}, True),
+        ({"kv_dtype": FP8_DTYPE}, False),
+        ({"query_len": MAX_3D_QUERY_LEN}, False),
+        ({"query_len": 513, "scratch_rows": 1026}, False),
+        ({"max_seqlen_k": CANVAS_MIN_SEGMENT_KEYS - 1}, False),
+        ({"window": (1023, 0)}, False),
+        ({"scratch_rows": 511}, False),
+        ({"sm12x": False}, False),
+    ],
+)
+def test_wide_head_canvas_admission(monkeypatch, options, expected):
+    kwargs = _canvas_launch(monkeypatch, **options)
+    assert kwargs["IS_3D"] is expected
+    if not expected:
+        assert "num_warps" not in kwargs and kwargs["MIN_SEGMENT_TILES"] == 1
+        return
+    fp8 = "q_dtype" in options
+    assert kwargs["BLOCK_M"] == 32
+    assert kwargs["TILE_SIZE"] == (64 if fp8 else 32)
+    assert kwargs["num_warps"] == (8 if fp8 else 4)
+    assert kwargs["MIN_SEGMENT_TILES"] * kwargs["TILE_SIZE"] == CANVAS_MIN_SEGMENT_KEYS
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
+    ),
+    reason="wide-head canvas split-K is enabled on SM12x only",
+)
+@pytest.mark.parametrize("q_dtype", [None, FP8_DTYPE])
+@pytest.mark.parametrize("causal", [False, True, "per_sequence"])
+@torch.inference_mode()
+def test_wide_head_canvas_matches_reference(monkeypatch, q_dtype, causal):
+    """DiffusionGemma full-attention shapes; the contexts split 2, 1, 3 and 16
+    ways and are not multiples of the tile."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(0)
+    reduce_grids = _spy_reduce_segments(monkeypatch)
+    query_lens = [256, 100, 256, 256]
+    kv_lens = [2049, 356, 6000, 40001]
+    num_seqs, num_heads, num_kv_heads, head_size, block_size = 4, 16, 2, 512, 32
+    if causal == "per_sequence":
+        causal_flags = [True, False, False, True]
+        causal_arg = torch.tensor(causal_flags)
+    else:
+        causal_flags = [causal] * num_seqs
+        causal_arg = causal
+
+    dtype = torch.bfloat16
+    query = torch.randn(sum(query_lens), num_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(6144, block_size, num_kv_heads, head_size, dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    max_blocks = cdiv(max(kv_lens), block_size)
+    block_tables = torch.randperm(6144, dtype=torch.int32)[: num_seqs * max_blocks]
+    block_tables = block_tables.view(num_seqs, max_blocks)
+    cu_query_lens = torch.tensor([0] + query_lens).cumsum(0, dtype=torch.int32)
+
+    q, k, v = query, key_cache, value_cache
+    quant: dict = dict(q_descale=None, k_descale=None, v_descale=None)
+    if q_dtype is not None:
+        q, k, v = (t.to(q_dtype) for t in (query, key_cache, value_cache))
+        query, key_cache, value_cache = (t.to(dtype) for t in (q, k, v))
+        ones = torch.ones((num_seqs, num_kv_heads))
+        quant = dict(
+            q_descale=torch.tensor(1.0),
+            k_descale=ones,
+            v_descale=ones,
+            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        )
+
+    rows = sum(query_lens)
+    output = torch.empty_like(query)
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens),
+        softmax_scale=head_size**-0.5,
+        causal=causal_arg,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        seq_threshold_3D=8,
+        num_par_softmax_segments=16,
+        softmax_segm_output=torch.empty((rows, num_heads, 16, head_size)),
+        softmax_segm_max=torch.empty((rows, num_heads, 16)),
+        softmax_segm_expsum=torch.empty((rows, num_heads, 16)),
+        **quant,
+    )
+    assert len(reduce_grids) == 1
+
+    ref_output = torch.cat(
+        [
+            ref_paged_attn(
+                query=query[cu_query_lens[i] : cu_query_lens[i + 1]].clone(),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                query_lens=[query_lens[i]],
+                kv_lens=[kv_lens[i]],
+                block_tables=block_tables[i : i + 1],
+                scale=head_size**-0.5,
+                causal=causal_flags[i],
+            )
+            for i in range(num_seqs)
+        ]
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
 def ref_paged_attn(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -393,6 +563,7 @@ def ref_paged_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    causal: bool = True,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
@@ -421,6 +592,8 @@ def ref_paged_attn(
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
         empty_mask = torch.ones(query_len, kv_len)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        if not causal:
+            mask.zero_()
         if sliding_window is not None:
             sliding_window_mask = (
                 torch.triu(

@@ -42,6 +42,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention import (
     MAX_3D_QUERY_LEN,
     unified_attention,
+    use_wide_head_canvas,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -55,6 +56,7 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+CANVAS_SPLIT_K_MAX_SEQS = 4  # Diffusion canvases held by the split-K scratch
 
 
 @dataclass
@@ -186,6 +188,35 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                     self.num_par_softmax_segments // NUM_PAR_SOFTMAX_SEGMENTS,
                 ),
             )
+        # Diffusion canvases on wide heads run split-K (use_wide_head_canvas).
+        # Size their scratch at this group's head size, which can exceed the
+        # model's (DiffusionGemma: 512 global, 256 sliding).
+        diffusion_config = vllm_config.diffusion_config
+        canvas_length = (
+            diffusion_config.canvas_length if diffusion_config is not None else None
+        )
+        if (
+            canvas_length is not None
+            and kv_cache_spec.kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
+            and use_wide_head_canvas(
+                kv_cache_spec.head_size,
+                canvas_length,
+                getattr(kv_cache_spec, "sliding_window", None) is not None,
+            )
+        ):
+            canvas_seqs = min(
+                CANVAS_SPLIT_K_MAX_SEQS, vllm_config.scheduler_config.max_num_seqs
+            )
+            headdim_padded = max(
+                headdim_padded, next_power_of_2(kv_cache_spec.head_size)
+            )
+            max_num_tokens_3d = max(
+                max_num_tokens_3d,
+                cdiv(
+                    canvas_seqs * canvas_length * NUM_PAR_SOFTMAX_SEGMENTS,
+                    self.num_par_softmax_segments,
+                ),
+            )
         self.softmax_segm_output = torch.empty(
             (
                 max_num_tokens_3d,
@@ -262,9 +293,11 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
             or self.softmax_segm_max.shape[0] < num_actual_tokens
+            or max_query_len > MAX_3D_QUERY_LEN
         ):
-            # The 16-segment grid fills the SMs, or the 64-segment rows cannot
-            # hold every query token: same scratch, 16-segment layout.
+            # The 16-segment grid fills the SMs, the 64-segment rows cannot
+            # hold every query token, or this is a canvas pass: same scratch,
+            # 16-segment layout.
             segments = NUM_PAR_SOFTMAX_SEGMENTS
             attn_metadata.num_par_softmax_segments = segments
             attn_metadata.softmax_segm_output = self.softmax_segm_output.view(

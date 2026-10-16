@@ -1102,6 +1102,11 @@ class DiffusionGemmaModelState(ModelState):
         if actual_num_reqs < num_reqs:
             self._causal_buf[actual_num_reqs:num_reqs] = 0
         causal: bool | torch.Tensor = self._causal_buf[:num_reqs]
+        if for_capture:
+            # Capture with worst-case max_seq_len so the graph is valid at any replay.
+            max_seq_len = self.max_model_len
+        else:
+            max_seq_len = int(input_batch.seq_lens_cpu_upper_bound[:num_reqs].max())
 
         return build_attn_metadata(
             attn_groups=attn_groups,
@@ -1111,7 +1116,7 @@ class DiffusionGemmaModelState(ModelState):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=input_batch.seq_lens,
-            max_seq_len=self.max_model_len,
+            max_seq_len=max_seq_len,
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=kv_cache_config,
